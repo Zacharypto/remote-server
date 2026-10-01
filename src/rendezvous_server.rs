@@ -932,18 +932,6 @@ impl RendezvousServer {
         }
     }
 
-    /// Haxfer: by-value 版本的 send_to_sink。
-    ///
-    /// 原函数签名是 `&mut Option<Sink>`。TCP 的 RegisterPeer 分支里需要
-    /// 「先从 sink 借出去发响应、再把 ConfigureUpdate 也发出去」，两次都要
-    /// 用到 sink，直接借会与 `handle_tcp` 的 `sink: &mut Option<Sink>` 冲突。
-    /// 这里补一个「把 Option 整体传进来」的包装，内部自行转 &mut，
-    /// **不动** send_to_sink 的既有签名与全部调用点。
-    #[inline]
-    async fn send_to_sink_option(mut sink: Option<Sink>, msg: RendezvousMessage) {
-        Self::send_to_sink(&mut sink, msg).await;
-    }
-
     #[inline]
     async fn send_to_tcp_sync(
         &mut self,
