@@ -33,7 +33,7 @@ use hbb_common::{
 use ipnetwork::Ipv4Network;
 use sodiumoxide::crypto::sign;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     sync::Arc,
@@ -56,6 +56,7 @@ enum Sink {
 }
 type Sender = mpsc::UnboundedSender<Data>;
 type Receiver = mpsc::UnboundedReceiver<Data>;
+type SharedSink = Arc<Mutex<Option<Sink>>>;
 static ROTATION_RELAY_SERVER: AtomicUsize = AtomicUsize::new(0);
 type RelayServers = Vec<String>;
 const CHECK_RELAY_TIMEOUT: u64 = 3_000;
@@ -81,7 +82,9 @@ struct Inner {
 
 #[derive(Clone)]
 pub struct RendezvousServer {
-    tcp_punch: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
+    tcp_punch: Arc<Mutex<HashMap<SocketAddr, SharedSink>>>,
+    tcp_peers: Arc<Mutex<HashMap<String, SharedSink>>>,
+    tcp_peer_ids: Arc<Mutex<HashSet<String>>>,
     pm: PeerMap,
     tx: Sender,
     relay_servers: Arc<RelayServers>,
@@ -129,6 +132,8 @@ impl RendezvousServer {
         };
         let mut rs = Self {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
+            tcp_peers: Arc::new(Mutex::new(HashMap::new())),
+            tcp_peer_ids: Arc::new(Mutex::new(HashSet::new())),
             pm,
             tx: tx.clone(),
             relay_servers: Default::default(),
@@ -327,6 +332,7 @@ impl RendezvousServer {
                     // B registered
                     if !rp.id.is_empty() {
                         log::trace!("New peer registered: {:?} {:?}", &rp.id, &addr);
+                        self.unbind_tcp_peer(&rp.id).await;
                         self.update_addr(rp.id, addr, socket).await?;
                         if self.inner.serial > rp.serial {
                             let mut msg_out = RendezvousMessage::new();
@@ -342,6 +348,8 @@ impl RendezvousServer {
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
                     // Haxfer: 业务逻辑已抽到 handle_register_pk_core()，
                     // 此处只负责「按 UDP 通道发响应」。行为与上游完全一致。
+                    let peer_id = rk.id.clone();
+                    self.unbind_tcp_peer(&peer_id).await;
                     let res = self.handle_register_pk_core(rk, addr).await;
                     if let Some(res) = res {
                         send_rk_res(socket, addr, res).await?;
@@ -398,7 +406,7 @@ impl RendezvousServer {
     async fn handle_tcp(
         &mut self,
         bytes: &[u8],
-        sink: &mut Option<Sink>,
+        sink: &SharedSink,
         addr: SocketAddr,
         key: &str,
         ws: bool,
@@ -407,23 +415,25 @@ impl RendezvousServer {
             match msg_in.union {
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
                     // there maybe several attempt, so sink can be none
-                    if let Some(sink) = sink.take() {
-                        self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
-                    }
+                    self.tcp_punch
+                        .lock()
+                        .await
+                        .insert(try_into_v4(addr), sink.clone());
                     allow_err!(self.handle_tcp_punch_hole_request(addr, ph, key, ws).await);
                     return true;
                 }
                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
-                    // there maybe several attempt, so sink can be none
-                    if let Some(sink) = sink.take() {
-                        self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
-                    }
-                    if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
+                    self.tcp_punch
+                        .lock()
+                        .await
+                        .insert(try_into_v4(addr), sink.clone());
+                    let target_id = rf.id.clone();
+                    if let Some(peer) = self.pm.get_in_memory(&target_id).await {
+                        let peer_addr = peer.read().await.socket_addr;
                         let mut msg_out = RendezvousMessage::new();
                         rf.socket_addr = AddrMangle::encode(addr).into();
                         msg_out.set_request_relay(rf);
-                        let peer_addr = peer.read().await.socket_addr;
-                        self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
+                        self.send_to_peer_route(&target_id, msg_out, Some(peer_addr)).await;
                     }
                     return true;
                 }
@@ -445,7 +455,7 @@ impl RendezvousServer {
                         }
                     }
                     msg_out.set_relay_response(rr);
-                    allow_err!(self.send_to_tcp_sync(msg_out, addr_b).await);
+                    allow_err!(self.send_to_addr_route(msg_out, addr_b, None).await);
                 }
                 Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
                     allow_err!(self.handle_hole_sent(phs, addr, None).await);
@@ -466,7 +476,7 @@ impl RendezvousServer {
                         res.cu = MessageField::from_option(Some(cu));
                     }
                     msg_out.set_test_nat_response(res);
-                    Self::send_to_sink(sink, msg_out).await;
+                    Self::send_to_sink_shared(sink, msg_out).await;
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
                     // Haxfer: 上游此处是硬编码 NOT_SUPPORT 桩 —— 它会把整个
@@ -476,14 +486,18 @@ impl RendezvousServer {
                     //
                     // 这正是「VPN 场景切 TCP 后永远离线」的服务端根因。
                     // 现在改为调用与 UDP 共用的业务逻辑，并按 TCP 通道回响应。
+                    let peer_id = rk.id.clone();
                     let res = self.handle_register_pk_core(rk, addr).await;
+                    if res == Some(register_pk_response::Result::OK) {
+                        self.bind_tcp_peer(&peer_id, sink, addr).await;
+                    }
                     if let Some(res) = res {
                         let mut msg_out = RendezvousMessage::new();
                         msg_out.set_register_pk_response(RegisterPkResponse {
                             result: res.into(),
                             ..Default::default()
                         });
-                        Self::send_to_sink(sink, msg_out).await;
+                        Self::send_to_sink_shared(sink, msg_out).await;
                     }
                     // ⚠️ 必须 return true：handle_tcp 的 bool 语义是
                     //    「保持读循环」，返回 false 会被上层 break。
@@ -504,6 +518,9 @@ impl RendezvousServer {
                         let (request_pk, ip_change) = {
                             self.update_addr_notify(&rp.id, addr).await
                         };
+                        if !request_pk {
+                            self.bind_tcp_peer(&rp.id, sink, addr).await;
+                        }
                         if let Some(old) = ip_change {
                             log::info!("IP change of {} from {} to {} (tcp)", rp.id, old, addr);
                         }
@@ -512,7 +529,7 @@ impl RendezvousServer {
                             request_pk,
                             ..Default::default()
                         });
-                        Self::send_to_sink(sink, msg_out).await;
+                        Self::send_to_sink_shared(sink, msg_out).await;
                         if self.inner.serial > rp.serial {
                             let mut msg_out = RendezvousMessage::new();
                             msg_out.set_configure_update(ConfigUpdate {
@@ -520,7 +537,7 @@ impl RendezvousServer {
                                 rendezvous_servers: (*self.rendezvous_servers).clone(),
                                 ..Default::default()
                             });
-                            Self::send_to_sink(sink, msg_out).await;
+                            Self::send_to_sink_shared(sink, msg_out).await;
                         }
                     }
                     // ⚠️ 同上：必须 return true，否则连接被 break。
@@ -728,12 +745,7 @@ impl RendezvousServer {
             p.set_nat_type(t);
         }
         msg_out.set_punch_hole_response(p);
-        if let Some(socket) = socket {
-            socket.send(&msg_out, addr_a).await?;
-        } else {
-            self.send_to_tcp(msg_out, addr_a).await;
-        }
-        Ok(())
+        self.send_to_addr_route(msg_out, addr_a, socket).await
     }
 
     #[inline]
@@ -760,12 +772,7 @@ impl RendezvousServer {
         };
         p.set_is_local(true);
         msg_out.set_punch_hole_response(p);
-        if let Some(socket) = socket {
-            socket.send(&msg_out, addr_a).await?;
-        } else {
-            self.send_to_tcp(msg_out, addr_a).await;
-        }
-        Ok(())
+        self.send_to_addr_route(msg_out, addr_a, socket).await
     }
 
     #[inline]
@@ -775,7 +782,7 @@ impl RendezvousServer {
         ph: PunchHoleRequest,
         key: &str,
         ws: bool,
-    ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
+    ) -> ResultType<(RendezvousMessage, Option<String>, Option<SocketAddr>)> {
         let mut ph = ph;
         if !key.is_empty() && ph.licence_key != key {
             log::warn!("Authentication failed from {} for peer {} - invalid key", addr, ph.id);
@@ -784,7 +791,7 @@ impl RendezvousServer {
                 failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
                 ..Default::default()
             });
-            return Ok((msg_out, None));
+            return Ok((msg_out, None, None));
         }
         let id = ph.id;
         // punch hole request from A, relay to B,
@@ -803,7 +810,7 @@ impl RendezvousServer {
                     failure: punch_hole_response::Failure::OFFLINE.into(),
                     ..Default::default()
                 });
-                return Ok((msg_out, None));
+                return Ok((msg_out, None, None));
             }
             
             // record punch hole request (from addr -> peer id/peer_addr)
@@ -826,7 +833,13 @@ impl RendezvousServer {
             let peer_is_lan = self.is_lan(peer_addr);
             let is_lan = self.is_lan(addr);
             let mut relay_server = self.get_relay_server(addr.ip(), peer_addr.ip());
-            if ALWAYS_USE_RELAY.load(Ordering::SeqCst) || (peer_is_lan ^ is_lan) {
+            let target_is_tcp = self.tcp_peers.lock().await.contains_key(&id);
+            let source_is_tcp = self.tcp_punch.lock().await.contains_key(&try_into_v4(addr));
+            if ALWAYS_USE_RELAY.load(Ordering::SeqCst)
+                || (peer_is_lan ^ is_lan)
+                || target_is_tcp
+                || source_is_tcp
+            {
                 if peer_is_lan {
                     // https://github.com/rustdesk/rustdesk-server/issues/24
                     relay_server = self.inner.local_ip.clone()
@@ -834,6 +847,8 @@ impl RendezvousServer {
                 ph.nat_type = NatType::SYMMETRIC.into(); // will force relay
             }
             let same_intranet: bool = !ws
+                && !target_is_tcp
+                && !source_is_tcp
                 && (peer_is_lan && is_lan || {
                     match (peer_addr, addr) {
                         (SocketAddr::V4(a), SocketAddr::V4(b)) => a.ip() == b.ip(),
@@ -868,14 +883,14 @@ impl RendezvousServer {
                     ..Default::default()
                 });
             }
-            Ok((msg_out, Some(peer_addr)))
+            Ok((msg_out, Some(id), Some(peer_addr)))
         } else {
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 failure: punch_hole_response::Failure::ID_NOT_EXIST.into(),
                 ..Default::default()
             });
-            Ok((msg_out, None))
+            Ok((msg_out, None, None))
         }
     }
 
@@ -908,12 +923,86 @@ impl RendezvousServer {
         Ok(())
     }
 
+    async fn unbind_tcp_peer(&self, id: &str) {
+        let removed = self.tcp_peers.lock().await.remove(id);
+        self.tcp_peer_ids.lock().await.remove(id);
+        if let Some(sink) = removed {
+            let still_used = self
+                .tcp_peers
+                .lock()
+                .await
+                .values()
+                .any(|current| Arc::ptr_eq(current, &sink));
+            if !still_used {
+                self.tcp_punch
+                    .lock()
+                    .await
+                    .retain(|_, current| !Arc::ptr_eq(current, &sink));
+            }
+        }
+    }
+
+    async fn bind_tcp_peer(&self, id: &str, sink: &SharedSink, addr: SocketAddr) {
+        self.tcp_peer_ids.lock().await.insert(id.to_owned());
+        self.tcp_peers.lock().await.insert(id.to_owned(), sink.clone());
+        self.tcp_punch.lock().await.insert(try_into_v4(addr), sink.clone());
+    }
+
+    async fn cleanup_tcp_sink(&self, sink: &SharedSink) {
+        let removed_ids = {
+            let mut peers = self.tcp_peers.lock().await;
+            let ids = peers
+                .iter()
+                .filter(|(_, current)| Arc::ptr_eq(current, sink))
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            for id in &ids {
+                peers.remove(id);
+            }
+            ids
+        };
+        self.tcp_punch
+            .lock()
+            .await
+            .retain(|_, current| !Arc::ptr_eq(current, sink));
+        if !removed_ids.is_empty() {
+            log::debug!("Removed TCP routes for peers {:?}", removed_ids);
+        }
+    }
+
+    async fn send_to_peer_route(&self, id: &str, msg: RendezvousMessage, udp_addr: Option<SocketAddr>) {
+        let sink = self.tcp_peers.lock().await.get(id).cloned();
+        if let Some(sink) = sink {
+            Self::send_to_sink_shared(&sink, msg).await;
+        } else if !self.tcp_peer_ids.lock().await.contains(id) {
+            if let Some(addr) = udp_addr.filter(|addr| addr.port() != 0) {
+                let _ = self.tx.send(Data::Msg(msg.into(), addr));
+            }
+        } else {
+            log::debug!("No active TCP route for peer {id}; suppressing UDP fallback");
+        }
+    }
+
+    async fn send_to_addr_route<'a>(
+        &mut self,
+        msg: RendezvousMessage,
+        addr: SocketAddr,
+        socket: Option<&'a mut FramedSocket>,
+    ) -> ResultType<()> {
+        if let Some(sink) = self.tcp_punch.lock().await.get(&try_into_v4(addr)).cloned() {
+            Self::send_to_sink_shared(&sink, msg).await;
+        } else if let Some(socket) = socket {
+            socket.send(&msg, addr).await?;
+        } else {
+            self.tx.send(Data::Msg(msg.into(), addr))?;
+        }
+        Ok(())
+    }
+
     #[inline]
-    async fn send_to_tcp(&mut self, msg: RendezvousMessage, addr: SocketAddr) {
-        let mut tcp = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
-        tokio::spawn(async move {
-            Self::send_to_sink(&mut tcp, msg).await;
-        });
+    async fn send_to_sink_shared(sink: &SharedSink, msg: RendezvousMessage) {
+        let mut guard = sink.lock().await;
+        Self::send_to_sink(&mut guard, msg).await;
     }
 
     #[inline]
@@ -938,8 +1027,9 @@ impl RendezvousServer {
         msg: RendezvousMessage,
         addr: SocketAddr,
     ) -> ResultType<()> {
-        let mut sink = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
-        Self::send_to_sink(&mut sink, msg).await;
+        if let Some(sink) = self.tcp_punch.lock().await.get(&try_into_v4(addr)).cloned() {
+            Self::send_to_sink_shared(&sink, msg).await;
+        }
         Ok(())
     }
 
@@ -951,9 +1041,9 @@ impl RendezvousServer {
         key: &str,
         ws: bool,
     ) -> ResultType<()> {
-        let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
-        if let Some(addr) = to_addr {
-            self.tx.send(Data::Msg(msg.into(), addr))?;
+        let (msg, target_id, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
+        if let Some(target_id) = target_id {
+            self.send_to_peer_route(&target_id, msg, to_addr).await;
         } else {
             self.send_to_tcp_sync(msg, addr).await?;
         }
@@ -967,14 +1057,12 @@ impl RendezvousServer {
         ph: PunchHoleRequest,
         key: &str,
     ) -> ResultType<()> {
-        let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, false).await?;
-        self.tx.send(Data::Msg(
-            msg.into(),
-            match to_addr {
-                Some(addr) => addr,
-                None => addr,
-            },
-        ))?;
+        let (msg, target_id, to_addr) = self.handle_punch_hole_request(addr, ph, key, false).await?;
+        if let Some(target_id) = target_id {
+            self.send_to_peer_route(&target_id, msg, to_addr).await;
+        } else {
+            self.tx.send(Data::Msg(msg.into(), addr))?;
+        }
         Ok(())
     }
 
@@ -1246,7 +1334,6 @@ impl RendezvousServer {
         key: &str,
         ws: bool,
     ) -> ResultType<()> {
-        let mut sink;
         if ws {
             use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
             let callback = |req: &Request, response: Response| {
@@ -1266,25 +1353,24 @@ impl RendezvousServer {
             };
             let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
             let (a, mut b) = ws_stream.split();
-            sink = Some(Sink::Ws(a));
+            let shared_sink = Arc::new(Mutex::new(Some(Sink::Ws(a))));
             while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
                 if let tungstenite::Message::Binary(bytes) = msg {
-                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                    if !self.handle_tcp(&bytes, &shared_sink, addr, key, ws).await {
                         break;
                     }
                 }
             }
+            self.cleanup_tcp_sink(&shared_sink).await;
         } else {
             let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
-            sink = Some(Sink::TcpStream(a));
+            let shared_sink = Arc::new(Mutex::new(Some(Sink::TcpStream(a))));
             while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
-                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                if !self.handle_tcp(&bytes, &shared_sink, addr, key, ws).await {
                     break;
                 }
             }
-        }
-        if sink.is_none() {
-            self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+            self.cleanup_tcp_sink(&shared_sink).await;
         }
         log::debug!("Tcp connection from {:?} closed", addr);
         Ok(())
