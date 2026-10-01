@@ -46,6 +46,14 @@ env:
 jobs:
   image:
     runs-on: ubuntu-22.04
+    env:
+      # FROM scratch 镜像要求**静态链接**。musl-tools 提供了 musl-gcc，但 cargo
+      # 对 musl target 未必会自动选它 —— 必须显式指定，否则可能链到宿主 glibc，
+      # 产出在 scratch 里跑不起来的二进制（这正是 tcp1 镜像坏掉的原因）。
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      # 让带 C 代码/汇编的依赖（ring / libsodium-sys / libsqlite3-sys）也用 musl 工具链
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      AR_x86_64_unknown_linux_musl: ar
     steps:
       - name: Checkout（含子模块）
         uses: actions/checkout@v4
@@ -137,6 +145,34 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
+      # 先在本地构建一份**不推送**，验证通过才推 —— 否则坏镜像会直接覆盖
+      # GHCR 上的 :latest，服务器 pull 到就起不来（tcp1 就是这么坏掉的）。
+      - name: 本地构建镜像（不推送，待验证）
+        uses: docker/build-push-action@v5
+        with:
+          context: .image-context
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: haxfer-hbbs:verify
+
+      # 真正跑一次容器。ldd 断言能挡住「动态链接塞进 scratch」，
+      # 这一步再确认二进制在 scratch 环境里确实能被 exec。
+      - name: 冒烟测试：镜像内二进制可执行
+        run: |
+          set +e
+          out=$(timeout 10 docker run --rm --entrypoint /usr/bin/hbbs haxfer-hbbs:verify -V 2>&1)
+          rc=$?
+          set -e
+          echo "exit=$rc"
+          echo "$out"
+          # 动态加载器缺失时 Docker 会报 "no such file or directory" / "not found"
+          if echo "$out" | grep -qiE "no such file or directory|executable file not found"; then
+            echo "::error::二进制无法在 scratch 镜像中执行（疑似动态链接）—— 拒绝推送"
+            exit 1
+          fi
+          echo "OK：二进制在 scratch 镜像中可执行"
+
       - name: 构建并推送 classic 镜像
         uses: docker/build-push-action@v5
         with:
@@ -163,21 +199,3 @@ jobs:
             echo "docker compose pull && docker compose up -d"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-
-      # 真正跑一次容器。ldd 断言能挡住「动态链接塞进 scratch」，
-      # 这一步再确认二进制在 scratch 环境里确实能被 exec。
-      - name: 冒烟测试：镜像内二进制可执行
-        run: |
-          IMAGE="ghcr.io/${OWNER}/${IMAGE_NAME}:${TAG}"
-          set +e
-          out=$(timeout 10 docker run --rm --entrypoint /usr/bin/hbbs "$IMAGE" -V 2>&1)
-          rc=$?
-          set -e
-          echo "exit=$rc"
-          echo "$out"
-          # 动态加载器缺失时 Docker 会报 "no such file or directory" / "not found"
-          if echo "$out" | grep -qiE "no such file or directory|executable file not found"; then
-            echo "::error::二进制无法在 scratch 镜像中执行（疑似动态链接）"
-            exit 1
-          fi
-          echo "OK：二进制在 scratch 镜像中可执行"
