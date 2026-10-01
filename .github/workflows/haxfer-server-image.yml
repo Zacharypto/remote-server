@@ -54,6 +54,8 @@ jobs:
 
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
 
       - name: 缓存 cargo
         uses: actions/cache@v4
@@ -69,20 +71,43 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config libssl-dev clang
+            build-essential pkg-config libssl-dev clang musl-tools
 
+      # ⚠️ 必须用 musl target 做**静态链接**。
+      #    docker-classic/Dockerfile 是 `FROM scratch` —— 里面没有 glibc、
+      #    没有动态加载器。glibc 动态链接的二进制放进去一启动就报
+      #    "no such file or directory"（找不到 ld-linux），容器直接挂。
+      #    官方 build.yaml 的 Linux 构建同样用 x86_64-unknown-linux-musl，
+      #    这里对齐它，并保留 --all-features 以匹配官方产物能力。
       # ⚠️ 不加 --cfg has_std：那是本机 Windows 管道沙箱的绕过手段，
       #    Linux runner 上 autocfg 能正常探测。
-      - name: 编译 hbbs / hbbr（release）
-        run: cargo build --release --locked --bin hbbs --bin hbbr
+      - name: 编译 hbbs / hbbr（release，musl 静态链接）
+        run: |
+          cargo build --release --locked --all-features \
+            --target x86_64-unknown-linux-musl \
+            --bin hbbs --bin hbbr
 
       - name: 组装 classic 镜像构建上下文
         run: |
           mkdir -p .image-context
-          cp target/release/hbbs .image-context/hbbs
-          cp target/release/hbbr .image-context/hbbr
+          cp target/x86_64-unknown-linux-musl/release/hbbs .image-context/hbbs
+          cp target/x86_64-unknown-linux-musl/release/hbbr .image-context/hbbr
           cp docker-classic/Dockerfile .image-context/Dockerfile
           ls -la .image-context
+
+      # 防止「动态链接的二进制塞进 scratch 镜像」这个坑再次发生。
+      # 上一次镜像就是这么坏的：容器起不来，客户端全部停在「正在接入网络」。
+      - name: 断言二进制为静态链接
+        run: |
+          for bin in hbbs hbbr; do
+            if ldd ".image-context/$bin" 2>&1 | grep -qE "not a dynamic executable|statically linked"; then
+              echo "OK  $bin 是静态链接"
+            else
+              echo "FAIL $bin 不是静态链接 —— FROM scratch 里跑不起来："
+              ldd ".image-context/$bin" || true
+              exit 1
+            fi
+          done
 
       # GHCR 的镜像名必须全小写，而 GitHub 用户名可能含大写
       - name: 归一化 owner 为小写
@@ -138,3 +163,21 @@ jobs:
             echo "docker compose pull && docker compose up -d"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # 真正跑一次容器。ldd 断言能挡住「动态链接塞进 scratch」，
+      # 这一步再确认二进制在 scratch 环境里确实能被 exec。
+      - name: 冒烟测试：镜像内二进制可执行
+        run: |
+          IMAGE="ghcr.io/${OWNER}/${IMAGE_NAME}:${TAG}"
+          set +e
+          out=$(timeout 10 docker run --rm --entrypoint /usr/bin/hbbs "$IMAGE" -V 2>&1)
+          rc=$?
+          set -e
+          echo "exit=$rc"
+          echo "$out"
+          # 动态加载器缺失时 Docker 会报 "no such file or directory" / "not found"
+          if echo "$out" | grep -qiE "no such file or directory|executable file not found"; then
+            echo "::error::二进制无法在 scratch 镜像中执行（疑似动态链接）"
+            exit 1
+          fi
+          echo "OK：二进制在 scratch 镜像中可执行"
