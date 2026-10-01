@@ -46,14 +46,12 @@ env:
 jobs:
   image:
     runs-on: ubuntu-22.04
-    env:
-      # FROM scratch 镜像要求**静态链接**。musl-tools 提供了 musl-gcc，但 cargo
-      # 对 musl target 未必会自动选它 —— 必须显式指定，否则可能链到宿主 glibc，
-      # 产出在 scratch 里跑不起来的二进制（这正是 tcp1 镜像坏掉的原因）。
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-      # 让带 C 代码/汇编的依赖（ring / libsodium-sys / libsqlite3-sys）也用 musl 工具链
-      CC_x86_64_unknown_linux_musl: musl-gcc
-      AR_x86_64_unknown_linux_musl: ar
+    # ⚠️ 刻意**不**覆盖 musl 的 linker / CC（踩过坑，见 tcp3）。
+    #    rustc 对 x86_64-unknown-linux-musl 默认就静态链接，直接 cargo build 就对；
+    #    一旦把 linker 换成 musl-gcc，反而会链成「依赖 /lib/ld-musl-x86_64.so.1 的
+    #    动态二进制」。更阴的是：glibc 的 ldd 认不出 musl 解释器，会误报
+    #    "not a dynamic executable" —— 断言看着全绿，镜像却进不了 scratch。
+    #    ⇒ 静态与否必须用 readelf 查 INTERP 段，不能用 ldd。
     steps:
       - name: Checkout（含子模块）
         uses: actions/checkout@v4
@@ -104,17 +102,17 @@ jobs:
           ls -la .image-context
 
       # 防止「动态链接的二进制塞进 scratch 镜像」这个坑再次发生。
-      # 上一次镜像就是这么坏的：容器起不来，客户端全部停在「正在接入网络」。
-      - name: 断言二进制为静态链接
+      # ⚠️ 判据是 readelf 的 INTERP 段**必须不存在**，不是 ldd ——
+      #    glibc 的 ldd 对 musl 动态二进制会误报 "not a dynamic executable"。
+      - name: 断言二进制为静态链接（readelf INTERP）
         run: |
           for bin in hbbs hbbr; do
-            if ldd ".image-context/$bin" 2>&1 | grep -qE "not a dynamic executable|statically linked"; then
-              echo "OK  $bin 是静态链接"
-            else
-              echo "FAIL $bin 不是静态链接 —— FROM scratch 里跑不起来："
-              ldd ".image-context/$bin" || true
+            if readelf -l ".image-context/$bin" 2>/dev/null | grep -q INTERP; then
+              echo "FAIL $bin 含 INTERP 段 —— 它是动态二进制，FROM scratch 里跑不起来："
+              readelf -l ".image-context/$bin" | grep -A1 INTERP || true
               exit 1
             fi
+            echo "OK  $bin 无 INTERP 段（静态链接）"
           done
 
       # GHCR 的镜像名必须全小写，而 GitHub 用户名可能含大写
@@ -156,22 +154,25 @@ jobs:
           load: true
           tags: haxfer-hbbs:verify
 
-      # 真正跑一次容器。ldd 断言能挡住「动态链接塞进 scratch」，
-      # 这一步再确认二进制在 scratch 环境里确实能被 exec。
-      - name: 冒烟测试：镜像内二进制可执行
+      # 真正把 hbbs 跑起来 —— 不只是 `-V` 打印版本，而是让它真的监听端口。
+      # 「二进制能被 exec」和「服务能启动」一次验完。
+      # 失败时把输出塞进 ::error:: —— annotation 是无需认证即可读取的通道
+      # （日志下载要认证），方便远程排错。
+      - name: 冒烟测试：hbbs 能在 scratch 镜像中真正启动
         run: |
           set +e
-          out=$(timeout 10 docker run --rm --entrypoint /usr/bin/hbbs haxfer-hbbs:verify -V 2>&1)
+          out=$(timeout 15 docker run --rm --entrypoint /usr/bin/hbbs haxfer-hbbs:verify -p 21116 -k _ 2>&1)
           rc=$?
           set -e
-          echo "exit=$rc"
+          echo "exit=$rc（124 = 被 timeout 正常掐断，说明它在常驻运行）"
           echo "$out"
-          # 动态加载器缺失时 Docker 会报 "no such file or directory" / "not found"
-          if echo "$out" | grep -qiE "no such file or directory|executable file not found"; then
-            echo "::error::二进制无法在 scratch 镜像中执行（疑似动态链接）—— 拒绝推送"
-            exit 1
+          if echo "$out" | grep -q "Listening on tcp/udp"; then
+            echo "OK：hbbs 在 scratch 镜像中成功启动并监听"
+            exit 0
           fi
-          echo "OK：二进制在 scratch 镜像中可执行"
+          diag=$(echo "$out" | tr '\n' '|' | tr -s ' ' | head -c 600)
+          echo "::error::hbbs 未能在 scratch 镜像中启动（exit=$rc）output=[$diag]"
+          exit 1
 
       - name: 构建并推送 classic 镜像
         uses: docker/build-push-action@v5
