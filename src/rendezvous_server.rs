@@ -340,89 +340,12 @@ impl RendezvousServer {
                     }
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
-                    if rk.uuid.is_empty() || rk.pk.is_empty() {
-                        return Ok(());
+                    // Haxfer: 业务逻辑已抽到 handle_register_pk_core()，
+                    // 此处只负责「按 UDP 通道发响应」。行为与上游完全一致。
+                    let res = self.handle_register_pk_core(rk, addr).await;
+                    if let Some(res) = res {
+                        send_rk_res(socket, addr, res).await?;
                     }
-                    let id = rk.id;
-                    let ip = addr.ip().to_string();
-                    if id.len() < 6 {
-                        return send_rk_res(socket, addr, UUID_MISMATCH).await;
-                    } else if !self.check_ip_blocker(&ip, &id).await {
-                        return send_rk_res(socket, addr, TOO_FREQUENT).await;
-                    }
-                    let peer = self.pm.get_or(&id).await;
-                    let (changed, ip_changed) = {
-                        let peer = peer.read().await;
-                        if peer.uuid.is_empty() {
-                            (true, false)
-                        } else {
-                            if peer.uuid == rk.uuid {
-                                if peer.info.ip != ip && peer.pk != rk.pk {
-                                    log::warn!(
-                                        "Peer {} ip/pk mismatch: {}/{:?} vs {}/{:?}",
-                                        id,
-                                        ip,
-                                        rk.pk,
-                                        peer.info.ip,
-                                        peer.pk,
-                                    );
-                                    drop(peer);
-                                    return send_rk_res(socket, addr, UUID_MISMATCH).await;
-                                }
-                            } else {
-                                log::warn!(
-                                    "Peer {} uuid mismatch: {:?} vs {:?}",
-                                    id,
-                                    rk.uuid,
-                                    peer.uuid
-                                );
-                                drop(peer);
-                                return send_rk_res(socket, addr, UUID_MISMATCH).await;
-                            }
-                            let ip_changed = peer.info.ip != ip;
-                            (
-                                peer.uuid != rk.uuid || peer.pk != rk.pk || ip_changed,
-                                ip_changed,
-                            )
-                        }
-                    };
-                    let mut req_pk = peer.read().await.reg_pk;
-                    if req_pk.1.elapsed().as_secs() > 6 {
-                        req_pk.0 = 0;
-                    } else if req_pk.0 > 2 {
-                        return send_rk_res(socket, addr, TOO_FREQUENT).await;
-                    }
-                    req_pk.0 += 1;
-                    req_pk.1 = Instant::now();
-                    peer.write().await.reg_pk = req_pk;
-                    if ip_changed {
-                        let mut lock = IP_CHANGES.lock().await;
-                        if let Some((tm, ips)) = lock.get_mut(&id) {
-                            if tm.elapsed().as_secs() > IP_CHANGE_DUR {
-                                *tm = Instant::now();
-                                ips.clear();
-                                ips.insert(ip.clone(), 1);
-                            } else if let Some(v) = ips.get_mut(&ip) {
-                                *v += 1;
-                            } else {
-                                ips.insert(ip.clone(), 1);
-                            }
-                        } else {
-                            lock.insert(
-                                id.clone(),
-                                (Instant::now(), HashMap::from([(ip.clone(), 1)])),
-                            );
-                        }
-                    }
-                    if changed {
-                        self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
-                    }
-                    let mut msg_out = RendezvousMessage::new();
-                    msg_out.set_register_pk_response(RegisterPkResponse {
-                        result: register_pk_response::Result::OK.into(),
-                        ..Default::default()
-                    });
-                    socket.send(&msg_out, addr).await?
                 }
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
                     // UDP PunchHoleRequest is intentionally unsupported.
@@ -545,14 +468,63 @@ impl RendezvousServer {
                     msg_out.set_test_nat_response(res);
                     Self::send_to_sink(sink, msg_out).await;
                 }
-                Some(rendezvous_message::Union::RegisterPk(_)) => {
-                    let res = register_pk_response::Result::NOT_SUPPORT;
-                    let mut msg_out = RendezvousMessage::new();
-                    msg_out.set_register_pk_response(RegisterPkResponse {
-                        result: res.into(),
-                        ..Default::default()
-                    });
-                    Self::send_to_sink(sink, msg_out).await;
+                Some(rendezvous_message::Union::RegisterPk(rk)) => {
+                    // Haxfer: 上游此处是硬编码 NOT_SUPPORT 桩 —— 它会把整个
+                    // 消息丢掉（`_` 不绑定），不校验 uuid/pk/id、不写
+                    // last_reg_time、不落库，然后 handle_tcp 返回 false，
+                    // 连接被 handle_listener_inner 直接 break 掉。
+                    //
+                    // 这正是「VPN 场景切 TCP 后永远离线」的服务端根因。
+                    // 现在改为调用与 UDP 共用的业务逻辑，并按 TCP 通道回响应。
+                    let res = self.handle_register_pk_core(rk, addr).await;
+                    if let Some(res) = res {
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_register_pk_response(RegisterPkResponse {
+                            result: res.into(),
+                            ..Default::default()
+                        });
+                        Self::send_to_sink(sink, msg_out).await;
+                    }
+                    // ⚠️ 必须 return true：handle_tcp 的 bool 语义是
+                    //    「保持读循环」，返回 false 会被上层 break。
+                    return true;
+                }
+                Some(rendezvous_message::Union::RegisterPeer(rp)) => {
+                    // Haxfer: 上游 handle_tcp 里**完全没有 RegisterPeer 分支**，
+                    // 落进末尾 `_ => {}` 后返回 false → 连接立刻被关。
+                    //
+                    // TCP-only 模式下客户端必须靠 TCP 周期性发 RegisterPeer
+                    // 来维持在线（REG_TIMEOUT = 30s）。这里补上接收侧。
+                    if !rp.id.is_empty() {
+                        log::trace!("New peer registered via tcp: {:?} {:?}", &rp.id, &addr);
+                        // ⚠️ 顺序：update_addr_notify 借的是 &mut self，
+                        //    send_to_sink 借的是 sink —— 两者互不冲突，
+                        //    但必须先把 self 的借用结束再动 sink，
+                        //    故用块作用域把返回值取出来。
+                        let (request_pk, ip_change) = {
+                            self.update_addr_notify(&rp.id, addr).await
+                        };
+                        if let Some(old) = ip_change {
+                            log::info!("IP change of {} from {} to {} (tcp)", rp.id, old, addr);
+                        }
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_register_peer_response(RegisterPeerResponse {
+                            request_pk,
+                            ..Default::default()
+                        });
+                        Self::send_to_sink(sink, msg_out).await;
+                        if self.inner.serial > rp.serial {
+                            let mut msg_out = RendezvousMessage::new();
+                            msg_out.set_configure_update(ConfigUpdate {
+                                serial: self.inner.serial,
+                                rendezvous_servers: (*self.rendezvous_servers).clone(),
+                                ..Default::default()
+                            });
+                            Self::send_to_sink(sink, msg_out).await;
+                        }
+                    }
+                    // ⚠️ 同上：必须 return true，否则连接被 break。
+                    return true;
                 }
                 _ => {}
             }
@@ -560,14 +532,135 @@ impl RendezvousServer {
         false
     }
 
+    /// Haxfer: RegisterPk 的**传输无关**业务逻辑。
+    ///
+    /// 从上游 handle_udp 的 RegisterPk 分支原样搬来（逻辑零改动），
+    /// 只把「发响应」这一步交给调用方，于是 UDP 与 TCP 可以共用。
+    ///
+    /// 返回值语义（与上游各分支一一对应）:
+    ///   None                —— 消息不合法（uuid/pk 为空）。上游此处直接
+    ///                          `return Ok(())`，即**什么都不发**，等价
+    ///   Some(UUID_MISMATCH) —— id 太短 / uuid 不一致 / ip+pk 同时变
+    ///   Some(TOO_FREQUENT)  —— 被 IP 拦截器拦下 或 6 秒内注册超过 2 次
+    ///   Some(OK)            —— 成功（已更新内存与数据库）
+    #[inline]
+    async fn handle_register_pk_core(
+        &mut self,
+        rk: RegisterPk,
+        addr: SocketAddr,
+    ) -> Option<register_pk_response::Result> {
+        if rk.uuid.is_empty() || rk.pk.is_empty() {
+            return None;
+        }
+        let id = rk.id;
+        let ip = addr.ip().to_string();
+        if id.len() < 6 {
+            return Some(UUID_MISMATCH);
+        } else if !self.check_ip_blocker(&ip, &id).await {
+            return Some(TOO_FREQUENT);
+        }
+        let peer = self.pm.get_or(&id).await;
+        let (changed, ip_changed) = {
+            let peer = peer.read().await;
+            if peer.uuid.is_empty() {
+                (true, false)
+            } else {
+                if peer.uuid == rk.uuid {
+                    if peer.info.ip != ip && peer.pk != rk.pk {
+                        log::warn!(
+                            "Peer {} ip/pk mismatch: {}/{:?} vs {}/{:?}",
+                            id,
+                            ip,
+                            rk.pk,
+                            peer.info.ip,
+                            peer.pk,
+                        );
+                        drop(peer);
+                        return Some(UUID_MISMATCH);
+                    }
+                } else {
+                    log::warn!("Peer {} uuid mismatch: {:?} vs {:?}", id, rk.uuid, peer.uuid);
+                    drop(peer);
+                    return Some(UUID_MISMATCH);
+                }
+                let ip_changed = peer.info.ip != ip;
+                (
+                    peer.uuid != rk.uuid || peer.pk != rk.pk || ip_changed,
+                    ip_changed,
+                )
+            }
+        };
+        let mut req_pk = peer.read().await.reg_pk;
+        if req_pk.1.elapsed().as_secs() > 6 {
+            req_pk.0 = 0;
+        } else if req_pk.0 > 2 {
+            return Some(TOO_FREQUENT);
+        }
+        req_pk.0 += 1;
+        req_pk.1 = Instant::now();
+        peer.write().await.reg_pk = req_pk;
+        if ip_changed {
+            let mut lock = IP_CHANGES.lock().await;
+            if let Some((tm, ips)) = lock.get_mut(&id) {
+                if tm.elapsed().as_secs() > IP_CHANGE_DUR {
+                    *tm = Instant::now();
+                    ips.clear();
+                    ips.insert(ip.clone(), 1);
+                } else if let Some(v) = ips.get_mut(&ip) {
+                    *v += 1;
+                } else {
+                    ips.insert(ip.clone(), 1);
+                }
+            } else {
+                lock.insert(id.clone(), (Instant::now(), HashMap::from([(ip.clone(), 1)])));
+            }
+        }
+        if changed {
+            self.pm
+                .update_pk(id, peer, addr, rk.uuid, rk.pk, ip)
+                .await;
+        }
+        Some(register_pk_response::Result::OK)
+    }
+
     #[inline]
     async fn update_addr(
+        // Haxfer: 业务逻辑已拆分 —— 纯状态更新在 update_addr_notify()，
+        // 本函数现在只负责「取结果 + 按 UDP 通道回 RegisterPeerResponse」。
         &mut self,
         id: String,
         socket_addr: SocketAddr,
         socket: &mut FramedSocket,
     ) -> ResultType<()> {
-        let (request_pk, ip_change) = if let Some(old) = self.pm.get_in_memory(&id).await {
+        let (request_pk, ip_change) = self.update_addr_notify(&id, socket_addr).await;
+        if let Some(old) = ip_change {
+            log::info!("IP change of {} from {} to {}", id, old, socket_addr);
+        }
+        let mut msg_out = RendezvousMessage::new();
+        msg_out.set_register_peer_response(RegisterPeerResponse {
+            request_pk,
+            ..Default::default()
+        });
+        socket.send(&msg_out, socket_addr).await
+    }
+
+    /// Haxfer: update_addr 的**传输无关**部分。
+    ///
+    /// 原 update_addr 把「更新内存状态」和「用 UDP 回 RegisterPeerResponse」
+    /// 揉在一起。这里拆开：本函数只做状态更新并返回 `(request_pk, ip_change)`，
+    /// 发送交给调用方 —— UDP 侧走 socket.send，TCP 侧走 send_to_sink。
+    ///
+    /// 语义与上游逐行一致：**只有 `!request_pk` 时才刷新
+    /// socket_addr / last_reg_time**（request_pk=true 表示需要对方先
+    /// RegisterPk 上报公钥，此时地址与在线时间都先不动）。
+    /// 返回的 ip_change 仅用于打日志。
+    #[inline]
+    async fn update_addr_notify(
+        &mut self,
+        id: &str,
+        socket_addr: SocketAddr,
+    ) -> (bool, Option<String>) {
+        let (request_pk, ip_change) = if let Some(old) = self.pm.get_in_memory(id).await {
             let mut old = old.write().await;
             let ip = socket_addr.ip();
             let ip_change = if old.socket_addr.port() != 0 {
@@ -593,16 +686,21 @@ impl RendezvousServer {
         } else {
             (true, None)
         };
-        if let Some(old) = ip_change {
-            log::info!("IP change of {} from {} to {}", id, old, socket_addr);
-        }
-        let mut msg_out = RendezvousMessage::new();
-        msg_out.set_register_peer_response(RegisterPeerResponse {
-            request_pk,
-            ..Default::default()
-        });
-        socket.send(&msg_out, socket_addr).await
+        (request_pk, ip_change)
     }
+
+    /// Haxfer: update_addr 的 TCP 版本。
+    ///
+    /// 与 UDP 版唯一的差别是响应走 TCP sink 而非 UDP socket。
+    /// 这是 TCP-only 模式下**唯一**能刷新 last_reg_time 的入口
+    /// （客户端 start_tcp 从不发 RegisterPeer，本补丁在服务端补齐接收，
+    ///  客户端侧需另行补发 —— 见 docs/客户网络环境适配.md §七）。
+    ///
+    /// ⚠️ 目前由 handle_tcp 的 RegisterPeer 分支**内联**调用
+    ///    update_addr_notify + send_to_sink，未单独抽成函数 ——
+    ///    因为 sink 的生命周期绑在 handle_tcp 的参数上，抽成独立方法
+    ///    反而要绕一圈所有权。这里保留注释说明设计意图，
+    ///    若将来其它分支也要回 RegisterPeerResponse，再抽不迟。
 
     #[inline]
     async fn handle_hole_sent<'a>(
@@ -832,6 +930,18 @@ impl RendezvousServer {
                 }
             }
         }
+    }
+
+    /// Haxfer: by-value 版本的 send_to_sink。
+    ///
+    /// 原函数签名是 `&mut Option<Sink>`。TCP 的 RegisterPeer 分支里需要
+    /// 「先从 sink 借出去发响应、再把 ConfigureUpdate 也发出去」，两次都要
+    /// 用到 sink，直接借会与 `handle_tcp` 的 `sink: &mut Option<Sink>` 冲突。
+    /// 这里补一个「把 Option 整体传进来」的包装，内部自行转 &mut，
+    /// **不动** send_to_sink 的既有签名与全部调用点。
+    #[inline]
+    async fn send_to_sink_option(mut sink: Option<Sink>, msg: RendezvousMessage) {
+        Self::send_to_sink(&mut sink, msg).await;
     }
 
     #[inline]
