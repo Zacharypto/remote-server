@@ -456,12 +456,16 @@ impl RendezvousServer {
                     }
                     msg_out.set_relay_response(rr);
                     allow_err!(self.send_to_addr_route(msg_out, addr_b, None).await);
+                    // Keep this rendezvous TCP stream alive for follow-up relay negotiation.
+                    return true;
                 }
                 Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
                     allow_err!(self.handle_hole_sent(phs, addr, None).await);
+                    return true;
                 }
                 Some(rendezvous_message::Union::LocalAddr(la)) => {
                     allow_err!(self.handle_local_addr(la, addr, None).await);
+                    return true;
                 }
                 Some(rendezvous_message::Union::TestNatRequest(tar)) => {
                     let mut msg_out = RendezvousMessage::new();
@@ -477,6 +481,7 @@ impl RendezvousServer {
                     }
                     msg_out.set_test_nat_response(res);
                     Self::send_to_sink_shared(sink, msg_out).await;
+                    return true;
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
                     // Haxfer: 上游此处是硬编码 NOT_SUPPORT 桩 —— 它会把整个
@@ -546,6 +551,8 @@ impl RendezvousServer {
                 _ => {}
             }
         }
+        // Returning false makes handle_listener_inner break the TCP read loop.
+        // Every recognized message arm above must return true after handling it.
         false
     }
 
@@ -709,9 +716,9 @@ impl RendezvousServer {
     /// Haxfer: update_addr 的 TCP 版本。
     ///
     /// 与 UDP 版唯一的差别是响应走 TCP sink 而非 UDP socket。
-    /// 这是 TCP-only 模式下**唯一**能刷新 last_reg_time 的入口
-    /// （客户端 start_tcp 从不发 RegisterPeer，本补丁在服务端补齐接收，
-    ///  客户端侧需另行补发 —— 见 docs/客户网络环境适配.md §七）。
+    /// 这是 TCP-only 模式下**唯一**能刷新 last_reg_time 的入口。
+    /// v0.2.0 客户端收到 RegisterPkResponse::OK 后，会在 TCP 上周期发送
+    /// RegisterPeer；服务端必须在此更新在线时间并经当前 TCP sink 回响应。
     ///
     /// ⚠️ 目前由 handle_tcp 的 RegisterPeer 分支**内联**调用
     ///    update_addr_notify + send_to_sink，未单独抽成函数 ——
