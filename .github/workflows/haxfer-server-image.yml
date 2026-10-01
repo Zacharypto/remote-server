@@ -91,10 +91,16 @@ jobs:
       - name: 决定 tag
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "TAG=${{ github.event.inputs.image-tag }}" >> "$GITHUB_ENV"
+            TAG="${{ github.event.inputs.image-tag }}"
           else
-            echo "TAG=${GITHUB_REF#refs/tags/}" >> "$GITHUB_ENV"
+            TAG="${GITHUB_REF#refs/tags/}"
+            # 触发用的 tag 带 haxfer- 前缀，是为了跟上游 rustdesk-server 的
+            # 版本 tag 区分开（别混进同一个 tag 命名空间）。
+            # 镜像名本身已经叫 haxfer-hbbs，这里把前缀去掉，免得重复。
+            TAG="${TAG#haxfer-}"
           fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "将推送镜像 tag：$TAG"
 
       - name: 登录 GHCR
         uses: docker/login-action@v3
