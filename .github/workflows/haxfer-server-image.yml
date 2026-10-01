@@ -1,0 +1,134 @@
+name: Build Haxfer hbbs image
+
+# 放到 Haxfer 服务端 fork 的 .github/workflows/ 目录下。
+#
+# 作用：把带 TCP 注册/路由补丁的 hbbs + hbbr 编译出来，打成 **classic 镜像**
+#      （FROM scratch + 两个二进制），推到 GHCR。
+#      生产 compose 只要把 image 指向它，docker compose up -d 即可。
+#
+# 为什么自己打镜像：
+#   生产是 docker compose 部署的（server/docker-compose.yml），跑的是
+#   rustdesk/rustdesk-server:latest —— 那是上游的 classic 镜像，
+#   handle_tcp 对 RegisterPk 返回 NOT_SUPPORT。补丁要生效就必须换镜像。
+#
+# 为什么用 GHCR 而不是 Docker Hub：
+#   GHCR 用内置 GITHUB_TOKEN 就能推（packages: write），不需要额外配
+#   DOCKER_HUB_USERNAME / PASSWORD 之类的 secrets。
+#   仓库自带的 build.yaml 推 Docker Hub 且只构建 s6 变体，与本部署不匹配。
+#
+# 产物：ghcr.io/<owner>/haxfer-hbbs:<tag>
+#   tag 手动触发时用输入的 tag，push tag 时用 tag 名。
+#
+# 用法（服务器上）：
+#   docker compose pull && docker compose up -d
+#   回滚：把 compose 的 image 改回 rustdesk/rustdesk-server:latest 再 up -d。
+#   data/ 目录（含密钥与设备库）不受影响 —— classic 镜像的 WORKDIR/HOME
+#   仍是 /root，与上游一致。
+
+on:
+  workflow_dispatch:
+    inputs:
+      image-tag:
+        description: "镜像 tag（例如 1.1.16-tcp1）"
+        required: true
+        default: "1.1.16-tcp1"
+  push:
+    tags:
+      - "haxfer-*"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: haxfer-hbbs
+
+jobs:
+  image:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout（含子模块）
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-hbbs-image-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-hbbs-image-
+
+      - name: 系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev clang
+
+      # ⚠️ 不加 --cfg has_std：那是本机 Windows 管道沙箱的绕过手段，
+      #    Linux runner 上 autocfg 能正常探测。
+      - name: 编译 hbbs / hbbr（release）
+        run: cargo build --release --locked --bin hbbs --bin hbbr
+
+      - name: 组装 classic 镜像构建上下文
+        run: |
+          mkdir -p .image-context
+          cp target/release/hbbs .image-context/hbbs
+          cp target/release/hbbr .image-context/hbbr
+          cp docker-classic/Dockerfile .image-context/Dockerfile
+          ls -la .image-context
+
+      # GHCR 的镜像名必须全小写，而 GitHub 用户名可能含大写
+      - name: 归一化 owner 为小写
+        run: echo "OWNER=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
+
+      - name: 决定 tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "TAG=${{ github.event.inputs.image-tag }}" >> "$GITHUB_ENV"
+          else
+            echo "TAG=${GITHUB_REF#refs/tags/}" >> "$GITHUB_ENV"
+          fi
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 构建并推送 classic 镜像
+        uses: docker/build-push-action@v5
+        with:
+          context: .image-context
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: |
+            ghcr.io/${{ env.OWNER }}/${{ env.IMAGE_NAME }}:${{ env.TAG }}
+            ghcr.io/${{ env.OWNER }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: 输出摘要
+        run: |
+          {
+            echo "## 镜像已推送"
+            echo ""
+            echo '```'
+            echo "ghcr.io/${{ env.OWNER }}/${{ env.IMAGE_NAME }}:${{ env.TAG }}"
+            echo '```'
+            echo ""
+            echo "服务器上改 compose 的 image 后执行："
+            echo ""
+            echo '```bash'
+            echo "docker compose pull && docker compose up -d"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

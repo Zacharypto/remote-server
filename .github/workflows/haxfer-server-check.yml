@@ -1,0 +1,70 @@
+name: Check Haxfer hbbs
+
+# 放到 Haxfer 服务端 fork 的 .github/workflows/ 目录下。
+#
+# 作用：只做「能不能编译」的校验 —— 把 TCP 注册/路由补丁的编译风险
+# 从「上线时才暴露」提前到「推分支时暴露」。
+#
+# 为什么需要它：
+#   hbbs 的 TCP 注册与 TCP-only 路由补丁是在本机写的，而本机受沙箱限制
+#   （嵌套 spawn 带管道会 ERROR_PIPE_BUSY）跑不了 cargo check，
+#   所以补丁从落地到现在的编译验证一直是空白。
+#
+# 触发方式：
+#   1. 手动：Actions -> Check Haxfer hbbs -> Run workflow
+#   2. push 到任意分支（paths 命中时）
+#
+# 产物：无。失败即说明补丁有编译问题，看日志定位。
+# 真正出可部署镜像用仓库自带的 build.yaml（需要 Docker Hub secrets）。
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'src/**.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/haxfer-server-check.yml'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout（含子模块）
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-hbbs-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-hbbs-
+
+      - name: 系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev clang
+
+      # ⚠️ 不要加 --cfg has_std：
+      #    那是本机沙箱（Windows 管道）的绕过手段，Linux runner 上 autocfg
+      #    能正常探测，加进去反而会掩盖真实的构建问题。
+      - name: cargo check hbbs
+        run: cargo check --bin hbbs --locked
+
+      - name: cargo check hbbr
+        run: cargo check --bin hbbr --locked
+
+      - name: rustfmt 检查（只看补丁涉及的文件）
+        run: rustfmt --check --edition 2021 src/rendezvous_server.rs
+        continue-on-error: true
