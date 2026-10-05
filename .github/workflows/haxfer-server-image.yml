@@ -154,25 +154,222 @@ jobs:
           load: true
           tags: haxfer-hbbs:verify
 
-      # 真正把 hbbs 跑起来 —— 不只是 `-V` 打印版本，而是让它真的监听端口。
-      # 「二进制能被 exec」和「服务能启动」一次验完。
-      # 失败时把输出塞进 ::error:: —— annotation 是无需认证即可读取的通道
-      # （日志下载要认证），方便远程排错。
-      - name: 冒烟测试：hbbs 能在 scratch 镜像中真正启动
+      # 日志里的 "Listening on tcp/udp" 在源码里早于 bind socket，不能拿它当 readiness。
+      # 真启动两个容器，并做实际 TCP RegisterPk/RegisterPeer + UDP RegisterPk 探测。
+      # 失败诊断写入 ::error::；只有此 smoke 通过，后面的 step 才能推镜像。
+      - name: 冒烟测试：scratch 中 hbbs/hbbr 实际监听
         run: |
           set +e
-          out=$(timeout 15 docker run --rm --entrypoint /usr/bin/hbbs haxfer-hbbs:verify -p 21116 -k _ 2>&1)
+          out=$(python3 - <<'PY'
+          import json
+          import socket
+          import subprocess
+          import sys
+          import time
+          import traceback
+
+          def run(args):
+              result = subprocess.run(args, text=True, capture_output=True)
+              if result.returncode:
+                  raise RuntimeError(f"command failed ({result.returncode}): {args}\n{result.stdout}\n{result.stderr}")
+              return result.stdout.strip()
+
+          def published_port(container, spec):
+              lines = run(["docker", "port", container, spec]).splitlines()
+              if not lines:
+                  raise RuntimeError(f"没有宿主端口映射：{container} {spec}")
+              return int(lines[0].rsplit(":", 1)[1])
+
+          def wait_running(container, timeout=12):
+              deadline = time.time() + timeout
+              while time.time() < deadline:
+                  data = json.loads(run(["docker", "inspect", container]))[0]
+                  if data["State"]["Running"]:
+                      return
+                  if data["State"].get("Status") == "exited":
+                      raise RuntimeError(f"{container} 已退出：{data['State'].get('ExitCode')} {data['State'].get('Error')}")
+                  time.sleep(0.2)
+              raise RuntimeError(f"{container} 未在 {timeout}s 内进入运行状态")
+
+          def probe_tcp(port, label):
+              with socket.create_connection(("127.0.0.1", port), timeout=2):
+                  pass
+              print(f"OK TCP {label} 127.0.0.1:{port}")
+
+          def varint(value):
+              out = bytearray()
+              while value > 0x7f:
+                  out.append((value & 0x7f) | 0x80)
+                  value >>= 7
+              out.append(value)
+              return bytes(out)
+
+          def field_bytes(number, value):
+              return varint((number << 3) | 2) + varint(len(value)) + value
+
+          def decode_varint(buf, offset=0):
+              value = shift = 0
+              while True:
+                  byte = buf[offset]
+                  offset += 1
+                  value |= (byte & 0x7f) << shift
+                  if not byte & 0x80:
+                      return value, offset
+                  shift += 7
+                  if shift > 63:
+                      raise RuntimeError("protobuf varint 过长")
+
+          def read_varint(sock):
+              value = shift = 0
+              while True:
+                  b = sock.recv(1)
+                  if not b:
+                      raise RuntimeError("TCP 对端在 protobuf 响应未读完整时关闭连接")
+                  byte = b[0]
+                  value |= (byte & 0x7f) << shift
+                  if not byte & 0x80:
+                      return value
+                  shift += 7
+                  if shift > 63:
+                      raise RuntimeError("protobuf varint 过长")
+
+          def read_response(sock):
+              tag = read_varint(sock)
+              wire = tag & 7
+              if wire != 2:
+                  raise RuntimeError(f"响应不是 length-delimited protobuf oneof，tag={tag}")
+              size = read_varint(sock)
+              payload = bytearray()
+              while len(payload) < size:
+                  chunk = sock.recv(size - len(payload))
+                  if not chunk:
+                      raise RuntimeError("TCP 对端关闭，protobuf payload 不完整")
+                  payload.extend(chunk)
+              return tag >> 3, bytes(payload)
+
+          def register_pk_message(peer_id, uuid_bytes, public_key):
+              body = (field_bytes(1, peer_id.encode())
+                      + field_bytes(2, uuid_bytes)
+                      + field_bytes(3, public_key))
+              return field_bytes(15, body)  # RendezvousMessage.register_pk
+
+          def register_peer_message(peer_id):
+              return field_bytes(1, field_bytes(1, peer_id.encode()))
+
+          def read_datagram_response(data):
+              tag, offset = decode_varint(data)
+              size, offset = decode_varint(data, offset)
+              if offset + size != len(data):
+                  raise RuntimeError(f"protobuf datagram 长度不匹配：{data.hex()}")
+              return tag >> 3, data[offset:]
+
+          def assert_pk_ok(field, payload, expected_id):
+              if field != 16:
+                  raise RuntimeError(f"期望 RegisterPkResponse，收到 oneof field {field}")
+              # RegisterPkResponse.result 是 field 1 的枚举；OK=0 可省略，其它结果非零。
+              result = 0
+              i = 0
+              while i < len(payload):
+                  key, i = decode_varint(payload, i)
+                  if key == 8:
+                      result, i = decode_varint(payload, i)
+                  elif key == 16:
+                      _, i = decode_varint(payload, i)  # keep_alive
+                  else:
+                      raise RuntimeError(f"RegisterPkResponse protobuf 字段异常：{payload.hex()}")
+              if result != 0:
+                  raise RuntimeError(f"RegisterPk {expected_id} 被拒绝，result={result}")
+              print(f"OK RegisterPk accepted: {expected_id}")
+
+          def assert_register_peer_ok(sock, peer_id):
+              field, payload = read_response(sock)
+              if field != 17:
+                  raise RuntimeError(f"期望 RegisterPeerResponse，收到 oneof field {field}")
+              i = 0
+              request_pk = False
+              while i < len(payload):
+                  key, i = decode_varint(payload, i)
+                  if key == 16:  # RegisterPeerResponse.request_pk = field 2
+                      value, i = decode_varint(payload, i)
+                      request_pk = bool(value)
+                  else:
+                      raise RuntimeError(f"RegisterPeerResponse protobuf 字段异常：{payload.hex()}")
+              if request_pk:
+                  raise RuntimeError(f"RegisterPeer {peer_id} 被服务端要求重新注册公钥")
+              print(f"OK RegisterPeer kept online: {peer_id}")
+
+          containers = ["haxfer-hbbs-smoke", "haxfer-hbbr-smoke"]
+          try:
+              run(["docker", "run", "-d", "--name", containers[0],
+                   "-p", "127.0.0.1::21116/tcp", "-p", "127.0.0.1::21116/udp",
+                   "-p", "127.0.0.1::21115/tcp", "--entrypoint", "/usr/bin/hbbs",
+                   "haxfer-hbbs:verify", "-p", "21116", "-k", "_"])
+              run(["docker", "run", "-d", "--name", containers[1],
+                   "-p", "127.0.0.1::21117/tcp", "--entrypoint", "/usr/bin/hbbr",
+                   "haxfer-hbbs:verify", "-p", "21117", "-k", "_"])
+              for container in containers:
+                  wait_running(container)
+              rendezvous_tcp = published_port(containers[0], "21116/tcp")
+              nat_tcp = published_port(containers[0], "21115/tcp")
+              relay_tcp = published_port(containers[1], "21117/tcp")
+              udp_port = published_port(containers[0], "21116/udp")
+              probe_tcp(rendezvous_tcp, "hbbs rendezvous")
+              probe_tcp(nat_tcp, "hbbs NAT test")
+              probe_tcp(relay_tcp, "hbbr relay")
+
+              # 在同一条裸 TCP 长连接上验证 TCP RegisterPk + RegisterPeer。
+              peer_id = "999991111"
+              uuid_bytes = bytes([1]) * 16
+              public_key = bytes([2]) * 32
+              with socket.create_connection(("127.0.0.1", rendezvous_tcp), timeout=3) as sock:
+                  sock.settimeout(3)
+                  sock.sendall(register_pk_message(peer_id, uuid_bytes, public_key))
+                  field, payload = read_response(sock)
+                  assert_pk_ok(field, payload, peer_id)
+                  sock.sendall(register_peer_message(peer_id))
+                  assert_register_peer_ok(sock, peer_id)
+
+              # 独立 peer ID 验证 UDP socket 不只是被 Docker 映射，实际 handler 也能收发。
+              deadline = time.time() + 8
+              last_error = None
+              attempt = 0
+              while time.time() < deadline:
+                  attempt += 1
+                  udp_id = f"99999{attempt:04d}"
+                  udp_request = register_pk_message(udp_id, bytes([3]) * 16, bytes([4]) * 32)
+                  try:
+                      with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                          sock.settimeout(0.7)
+                          sock.sendto(udp_request, ("127.0.0.1", udp_port))
+                          datagram, _ = sock.recvfrom(2048)
+                  except OSError as exc:
+                      last_error = exc
+                      time.sleep(0.2)
+                      continue
+                  field, payload = read_datagram_response(datagram)
+                  assert_pk_ok(field, payload, udp_id)
+                  print(f"OK UDP RegisterPk 127.0.0.1:{udp_port}")
+                  break
+              else:
+                  raise RuntimeError(f"UDP RegisterPk 没有响应：{last_error}")
+
+              print("OK：hbbs TCP 注册/保活、UDP 注册、NAT 端口与 hbbr 中继监听均已实际探测")
+          except Exception:
+              traceback.print_exc()
+              sys.exit(1)
+          finally:
+              for container in containers:
+                  subprocess.run(["docker", "rm", "-f", container], capture_output=True)
+          PY
+          )
           rc=$?
           set -e
-          echo "exit=$rc（124 = 被 timeout 正常掐断，说明它在常驻运行）"
           echo "$out"
-          if echo "$out" | grep -q "Listening on tcp/udp"; then
-            echo "OK：hbbs 在 scratch 镜像中成功启动并监听"
-            exit 0
+          if [ "$rc" -ne 0 ]; then
+            diag=$(printf '%s' "$out" | tr '\n' '|' | head -c 1000)
+            echo "::error::scratch 镜像真实监听冒烟测试失败：$diag"
+            exit 1
           fi
-          diag=$(echo "$out" | tr '\n' '|' | tr -s ' ' | head -c 600)
-          echo "::error::hbbs 未能在 scratch 镜像中启动（exit=$rc）output=[$diag]"
-          exit 1
 
       - name: 构建并推送 classic 镜像
         uses: docker/build-push-action@v5

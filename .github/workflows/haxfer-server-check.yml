@@ -25,6 +25,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/haxfer-server-check.yml'
+      - '.github/workflows/haxfer-server-image.yml'
 
 jobs:
   check:
