@@ -279,7 +279,9 @@ jobs:
               return field_bytes(15, body)  # RendezvousMessage.register_pk
 
           def register_peer_message(peer_id):
-              return field_bytes(1, field_bytes(1, peer_id.encode()))
+              # RendezvousMessage.register_peer 是 oneof 字段 6（字段 1 未使用）。
+              # 写错字段号时服务端解析不到 union，会直接关闭 TCP 连接。
+              return field_bytes(6, field_bytes(1, peer_id.encode()))
 
           def read_datagram_response(data):
               tag, offset = decode_varint(data)
