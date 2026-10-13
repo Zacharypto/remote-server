@@ -160,7 +160,8 @@ jobs:
       - name: 冒烟测试：scratch 中 hbbs/hbbr 实际监听
         run: |
           set +e
-          out=$(python3 - <<'PY'
+          # 2>&1 必须保留：Python traceback 走 stderr，只抓 stdout 会丢掉真正的失败原因。
+          out=$(python3 - <<'PY' 2>&1
           import json
           import socket
           import subprocess
@@ -219,33 +220,57 @@ jobs:
                   if shift > 63:
                       raise RuntimeError("protobuf varint 过长")
 
-          def read_varint(sock):
-              value = shift = 0
-              while True:
-                  b = sock.recv(1)
-                  if not b:
-                      raise RuntimeError("TCP 对端在 protobuf 响应未读完整时关闭连接")
-                  byte = b[0]
-                  value |= (byte & 0x7f) << shift
-                  if not byte & 0x80:
-                      return value
-                  shift += 7
-                  if shift > 63:
-                      raise RuntimeError("protobuf varint 过长")
+          # hbb_common::BytesCodec 的 TCP 分帧：首字节低 2 位给出长度头字节数，
+          # 长度本身左移 2 位存放。裸 protobuf 直接发会被当成不完整帧而挂住，
+          # 所以发送要加头、接收要先剥头。UDP 是无帧的，不受影响。
+          def frame(payload):
+              n = len(payload)
+              if n <= 0x3F:
+                  return bytes([n << 2]) + payload
+              if n <= 0x3FFF:
+                  return ((n << 2) | 0x1).to_bytes(2, "little") + payload
+              if n <= 0x3FFFFF:
+                  head = (n << 2) | 0x2
+                  return ((head & 0xFFFF).to_bytes(2, "little")
+                          + bytes([(head >> 16) & 0xFF]) + payload)
+              raise RuntimeError(f"探测消息过长，无法用 BytesCodec 分帧：{n}")
 
-          def read_response(sock):
-              tag = read_varint(sock)
-              wire = tag & 7
-              if wire != 2:
-                  raise RuntimeError(f"响应不是 length-delimited protobuf oneof，tag={tag}")
-              size = read_varint(sock)
+          def read_framed(sock):
+              first = sock.recv(1)
+              if not first:
+                  raise RuntimeError("TCP 对端在帧头之前关闭连接")
+              head_len = (first[0] & 0x3) + 1
+              rest = bytearray()
+              while len(rest) < head_len - 1:
+                  chunk = sock.recv(head_len - 1 - len(rest))
+                  if not chunk:
+                      raise RuntimeError("TCP 对端在帧头中间关闭连接")
+                  rest.extend(chunk)
+              size = first[0]
+              if head_len > 1:
+                  size |= rest[0] << 8
+              if head_len > 2:
+                  size |= rest[1] << 16
+              if head_len > 3:
+                  size |= rest[2] << 24
+              size >>= 2
               payload = bytearray()
               while len(payload) < size:
                   chunk = sock.recv(size - len(payload))
                   if not chunk:
-                      raise RuntimeError("TCP 对端关闭，protobuf payload 不完整")
+                      raise RuntimeError("TCP 对端在帧负载中间关闭连接")
                   payload.extend(chunk)
-              return tag >> 3, bytes(payload)
+              return bytes(payload)
+
+          def read_response(sock):
+              data = read_framed(sock)
+              tag, offset = decode_varint(data)
+              if tag & 7 != 2:
+                  raise RuntimeError(f"响应不是 length-delimited protobuf oneof，tag={tag}")
+              size, offset = decode_varint(data, offset)
+              if offset + size != len(data):
+                  raise RuntimeError(f"protobuf 帧内长度不匹配：{data.hex()}")
+              return tag >> 3, data[offset:]
 
           def register_pk_message(peer_id, uuid_bytes, public_key):
               body = (field_bytes(1, peer_id.encode())
@@ -322,11 +347,11 @@ jobs:
               uuid_bytes = bytes([1]) * 16
               public_key = bytes([2]) * 32
               with socket.create_connection(("127.0.0.1", rendezvous_tcp), timeout=3) as sock:
-                  sock.settimeout(3)
-                  sock.sendall(register_pk_message(peer_id, uuid_bytes, public_key))
+                  sock.settimeout(5)
+                  sock.sendall(frame(register_pk_message(peer_id, uuid_bytes, public_key)))
                   field, payload = read_response(sock)
                   assert_pk_ok(field, payload, peer_id)
-                  sock.sendall(register_peer_message(peer_id))
+                  sock.sendall(frame(register_peer_message(peer_id)))
                   assert_register_peer_ok(sock, peer_id)
 
               # 独立 peer ID 验证 UDP socket 不只是被 Docker 映射，实际 handler 也能收发。
