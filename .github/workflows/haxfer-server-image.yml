@@ -283,7 +283,7 @@ jobs:
 
           def assert_register_peer_ok(sock, peer_id):
               field, payload = read_response(sock)
-              if field != 17:
+              if field != 7:  # RendezvousMessage.register_peer_response
                   raise RuntimeError(f"期望 RegisterPeerResponse，收到 oneof field {field}")
               i = 0
               request_pk = False
